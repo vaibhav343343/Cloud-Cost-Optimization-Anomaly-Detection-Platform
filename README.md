@@ -65,6 +65,22 @@ graph TD
 
 After deploying the stack, manually subscribe your email address to the created SNS Topic (`CostOptimizationAlerts`) in the AWS Console to start receiving reports.
 
+## Tech Stack
+
+- **Compute**: AWS Lambda
+- **Database**: Amazon DynamoDB
+- **Messaging/Alerting**: Amazon SNS
+- **Event Management**: Amazon EventBridge
+- **AWS APIs & Services**: AWS Cost Explorer API, Amazon EC2, Amazon EBS, Elastic IPs
+- **Framework**: AWS Serverless Application Model (SAM)
+- **Programming Language**: Python 3.9 (`boto3`)
+
+## Author
+
+**Vaibhav Sudrik**
+- **Email**: [vaibhavsudrik2005@gmail.com](mailto:vaibhavsudrik2005@gmail.com)
+- **Education**: BSc Cloud Computing
+
 ## License
 
 MIT License
