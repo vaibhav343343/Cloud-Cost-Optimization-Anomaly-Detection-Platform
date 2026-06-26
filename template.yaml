@@ -1,0 +1,81 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Cloud-Cost-Optimization-Platform
+  
+  SAM Template for Cloud Cost Optimization Platform that analyzes AWS Cost Explorer, EC2, EBS, and Elastic IP to generate reports and send alerts.
+
+Globals:
+  Function:
+    Timeout: 300
+    MemorySize: 256
+    Runtime: python3.9
+    Tracing: Active
+    Environment:
+      Variables:
+        LOG_LEVEL: INFO
+
+Resources:
+  CostAnalyzerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/cost_analyzer/
+      Handler: app.lambda_handler
+      Architectures:
+        - x86_64
+      Environment:
+        Variables:
+          DYNAMODB_TABLE: !Ref CostReportsTable
+          SNS_TOPIC_ARN: !Ref CostAlertsTopic
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref CostReportsTable
+        - SNSPublishMessagePolicy:
+            TopicName: !GetAtt CostAlertsTopic.TopicName
+        - Statement:
+            - Effect: Allow
+              Action:
+                - ce:GetCostAndUsage
+                - ec2:DescribeInstances
+                - ec2:DescribeVolumes
+                - ec2:DescribeAddresses
+              Resource: "*"
+      Events:
+        ScheduledAnalysis:
+          Type: Schedule
+          Properties:
+            Schedule: rate(7 days)
+            Name: WeeklyCostAnalysisSchedule
+            Description: Trigger Cost Analyzer Lambda every week
+
+  CostReportsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: CostOptimizationReports
+      AttributeDefinitions:
+        - AttributeName: ReportId
+          AttributeType: S
+        - AttributeName: Timestamp
+          AttributeType: S
+      KeySchema:
+        - AttributeName: ReportId
+          KeyType: HASH
+        - AttributeName: Timestamp
+          KeyType: RANGE
+      BillingMode: PAY_PER_REQUEST
+
+  CostAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: CostOptimizationAlerts
+
+Outputs:
+  CostAnalyzerFunction:
+    Description: "Cost Analyzer Lambda Function ARN"
+    Value: !GetAtt CostAnalyzerFunction.Arn
+  CostReportsTable:
+    Description: "DynamoDB Table for storing reports"
+    Value: !Ref CostReportsTable
+  CostAlertsTopic:
+    Description: "SNS Topic for Cost Alerts"
+    Value: !Ref CostAlertsTopic
