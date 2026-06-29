@@ -1,7 +1,56 @@
+# AWS SAM build artifacts
 .aws-sam/
-.env
+samconfig.toml.bak
+
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
 *.pyo
+*.pyd
+*.egg
+*.egg-info/
+dist/
+build/
+*.so
+.Python
+env/
 venv/
 .venv/
+pip-log.txt
+pip-delete-this-directory.txt
+.tox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.log
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# scikit-learn / joblib model files (do not commit trained models)
+*.pkl
+*.joblib
+models/
+
+# Environment files (secrets)
+.env
+.env.*
+*.secret
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# CDK / Terraform (if used in the future)
+cdk.out/
+.terraform/
+*.tfstate
+*.tfstate.backup

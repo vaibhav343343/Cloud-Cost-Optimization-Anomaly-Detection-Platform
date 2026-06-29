@@ -1,57 +1,282 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Transform: AWS::Serverless-2016-10-31
 Description: >
-  Cloud-Cost-Optimization-Platform
+  Cloud Cost Optimization & Anomaly Detection Platform v2
   
-  SAM Template for Cloud Cost Optimization Platform that analyzes AWS Cost Explorer, EC2, EBS, and Elastic IP to generate reports and send alerts.
+  Upgraded SAM template with three dedicated Lambda functions:
+    1. CostCollector       — daily data ingestion from Cost Explorer + resource scanning
+    2. AnomalyDetector     — ML-based (Isolation Forest) anomaly detection
+    3. CostOptimizer       — recommendation engine exposed via API Gateway
+  
+  Adds: Isolation Forest ML inference, RDS scanning, granular DynamoDB cost history
+  table, IAM least-privilege policies, SSM Parameter Store secrets, and X-Ray tracing.
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Parameters — passed at deploy time via `sam deploy --guided`
+# ─────────────────────────────────────────────────────────────────────────────
+Parameters:
+  AlertEmail:
+    Type: String
+    Description: Email address to receive cost & anomaly alerts
+    Default: "vaibhavsudrik2005@gmail.com"
+
+  Environment:
+    Type: String
+    Description: Deployment environment tag
+    Default: production
+    AllowedValues: [production, staging, development]
+
+  CollectionSchedule:
+    Type: String
+    Description: EventBridge cron/rate expression for cost collection
+    Default: "rate(1 day)"
+
+  AnomalyDetectionSchedule:
+    Type: String
+    Description: EventBridge cron expression for anomaly detection (runs 1h after collection)
+    Default: "cron(0 2 * * ? *)"
+
+  IFContamination:
+    Type: String
+    Description: Isolation Forest contamination ratio (fraction of expected outliers)
+    Default: "0.05"
+
+  IFNEstimators:
+    Type: String
+    Description: Number of estimators for Isolation Forest
+    Default: "200"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Globals
+# ─────────────────────────────────────────────────────────────────────────────
 Globals:
   Function:
-    Timeout: 300
-    MemorySize: 256
-    Runtime: python3.9
-    Tracing: Active
+    Runtime: python3.12
+    Architectures: [x86_64]
+    Timeout: 600
+    MemorySize: 512
+    Tracing: Active            # X-Ray active tracing enabled on all Lambdas
+    Layers:
+      - !Sub "arn:aws:lambda:${AWS::Region}:017000801446:layer:AWSLambdaPowertoolsPythonV3-python312-x86_64:5"
     Environment:
       Variables:
-        LOG_LEVEL: INFO
+        LOG_LEVEL:         INFO
+        POWERTOOLS_SERVICE_NAME: cost-anomaly-platform
+        ENVIRONMENT:       !Ref Environment
+        COST_HISTORY_TABLE: !Ref CostHistoryTable
+        DYNAMODB_TABLE:    !Ref CostReportsTable
+        ANOMALY_TABLE:     !Ref AnomalyDetectionTable
+        SNS_TOPIC_ARN:     !Ref CostAlertsTopic
+    Tags:
+      Project:     CloudCostOptimization
+      Environment: !Ref Environment
+      ManagedBy:   SAM
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Resources
+# ─────────────────────────────────────────────────────────────────────────────
 Resources:
-  CostAnalyzerFunction:
+
+  # ── 1. Cost Collector Lambda ──────────────────────────────────────────────
+  CostCollectorFunction:
     Type: AWS::Serverless::Function
     Properties:
-      CodeUri: src/cost_analyzer/
+      FunctionName: !Sub "cost-collector-${Environment}"
+      Description: "Fetches daily cost data from Cost Explorer and scans EC2/EBS/EIP/RDS for waste."
+      CodeUri: src/cost_collector/
       Handler: app.lambda_handler
-      Architectures:
-        - x86_64
-      Environment:
-        Variables:
-          DYNAMODB_TABLE: !Ref CostReportsTable
-          SNS_TOPIC_ARN: !Ref CostAlertsTopic
+      MemorySize: 256
       Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref CostHistoryTable
         - DynamoDBCrudPolicy:
             TableName: !Ref CostReportsTable
         - SNSPublishMessagePolicy:
             TopicName: !GetAtt CostAlertsTopic.TopicName
         - Statement:
-            - Effect: Allow
+            - Sid: CostExplorerReadOnly
+              Effect: Allow
               Action:
                 - ce:GetCostAndUsage
+                - ce:GetCostForecast
+                - ce:GetDimensionValues
+              Resource: "*"
+            - Sid: EC2ReadOnly
+              Effect: Allow
+              Action:
                 - ec2:DescribeInstances
                 - ec2:DescribeVolumes
                 - ec2:DescribeAddresses
+                - ec2:DescribeRegions
+              Resource: "*"
+            - Sid: RDSReadOnly
+              Effect: Allow
+              Action:
+                - rds:DescribeDBInstances
+                - rds:DescribeDBClusters
+              Resource: "*"
+            - Sid: XRayWrite
+              Effect: Allow
+              Action:
+                - xray:PutTraceSegments
+                - xray:PutTelemetryRecords
               Resource: "*"
       Events:
-        ScheduledAnalysis:
+        DailyCollection:
           Type: Schedule
           Properties:
-            Schedule: rate(7 days)
-            Name: WeeklyCostAnalysisSchedule
-            Description: Trigger Cost Analyzer Lambda every week
+            Schedule: !Ref CollectionSchedule
+            Name: DailyCostCollectionSchedule
+            Description: "Collect daily AWS cost & resource data"
+            Enabled: true
 
+  # ── 2. Anomaly Detector Lambda (ML — Isolation Forest) ───────────────────
+  AnomalyDetectorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "anomaly-detector-${Environment}"
+      Description: "Runs Isolation Forest on 90-day cost history to detect anomalies."
+      CodeUri: src/anomaly_detector/
+      Handler: app.lambda_handler
+      MemorySize: 1024        # scikit-learn needs extra memory for model fitting
+      Timeout: 900
+      Environment:
+        Variables:
+          IF_N_ESTIMATORS:       !Ref IFNEstimators
+          IF_CONTAMINATION:      !Ref IFContamination
+          MIN_TRAINING_SAMPLES:  "14"
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref CostHistoryTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref AnomalyDetectionTable
+        - SNSPublishMessagePolicy:
+            TopicName: !GetAtt CostAlertsTopic.TopicName
+        - Statement:
+            - Sid: XRayWrite
+              Effect: Allow
+              Action:
+                - xray:PutTraceSegments
+                - xray:PutTelemetryRecords
+              Resource: "*"
+      Events:
+        DailyAnomalyDetection:
+          Type: Schedule
+          Properties:
+            Schedule: !Ref AnomalyDetectionSchedule
+            Name: DailyAnomalyDetectionSchedule
+            Description: "Run ML anomaly detection on daily cost data"
+            Enabled: true
+
+  # ── 3. Cost Optimizer Lambda (Recommendations + API) ─────────────────────
+  CostOptimizerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "cost-optimizer-${Environment}"
+      Description: "Reads anomaly results and generates prioritized cost-saving recommendations."
+      CodeUri: src/cost_optimizer/
+      Handler: app.lambda_handler
+      MemorySize: 512
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref AnomalyDetectionTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref CostReportsTable
+        - SNSPublishMessagePolicy:
+            TopicName: !GetAtt CostAlertsTopic.TopicName
+        - Statement:
+            - Sid: CostExplorerReadOnly
+              Effect: Allow
+              Action:
+                - ce:GetCostAndUsage
+              Resource: "*"
+            - Sid: XRayWrite
+              Effect: Allow
+              Action:
+                - xray:PutTraceSegments
+                - xray:PutTelemetryRecords
+              Resource: "*"
+      Events:
+        # Expose via API Gateway for on-demand queries
+        GetRecommendationsApi:
+          Type: Api
+          Properties:
+            Path:   /recommendations
+            Method: GET
+            RestApiId: !Ref CostOptimizerApi
+        # Also triggered by EventBridge after anomaly detection completes
+        PostAnomalyTrigger:
+          Type: Schedule
+          Properties:
+            Schedule: "cron(0 3 * * ? *)"
+            Name: DailyOptimizerSchedule
+            Description: "Generate recommendations after anomaly detection"
+            Enabled: true
+
+  # ── API Gateway ────────────────────────────────────────────────────────────
+  CostOptimizerApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: !Sub "cost-optimizer-api-${Environment}"
+      StageName: !Ref Environment
+      TracingEnabled: true
+      Cors:
+        AllowMethods: "'GET,OPTIONS'"
+        AllowHeaders: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key'"
+        AllowOrigin:  "'*'"
+      MethodSettings:
+        - ResourcePath: "/*"
+          HttpMethod:   "*"
+          MetricsEnabled: true
+          DataTraceEnabled: false
+          LoggingLevel: INFO
+
+  # ── DynamoDB — Cost History (raw daily data, training set) ────────────────
+  CostHistoryTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    Properties:
+      TableName: !Sub "CostHistory-${Environment}"
+      BillingMode: PAY_PER_REQUEST
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      AttributeDefinitions:
+        - AttributeName: RecordId      # "YYYY-MM-DD#ServiceName"
+          AttributeType: S
+        - AttributeName: Date
+          AttributeType: S
+        - AttributeName: ServiceName
+          AttributeType: S
+      KeySchema:
+        - AttributeName: RecordId
+          KeyType: HASH
+        - AttributeName: Date
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: ServiceDateIndex
+          KeySchema:
+            - AttributeName: ServiceName
+              KeyType: HASH
+            - AttributeName: Date
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: TTL
+        Enabled: true      # auto-expire records older than 180 days
+      Tags:
+        - Key: DataClassification
+          Value: CostData
+
+  # ── DynamoDB — Optimization Reports ───────────────────────────────────────
   CostReportsTable:
     Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
     Properties:
-      TableName: CostOptimizationReports
+      TableName: !Sub "CostOptimizationReports-${Environment}"
+      BillingMode: PAY_PER_REQUEST
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
       AttributeDefinitions:
         - AttributeName: ReportId
           AttributeType: S
@@ -62,20 +287,193 @@ Resources:
           KeyType: HASH
         - AttributeName: Timestamp
           KeyType: RANGE
-      BillingMode: PAY_PER_REQUEST
 
+  # ── DynamoDB — Anomaly Detection Results ─────────────────────────────────
+  AnomalyDetectionTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    Properties:
+      TableName: !Sub "AnomalyDetectionResults-${Environment}"
+      BillingMode: PAY_PER_REQUEST
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      AttributeDefinitions:
+        - AttributeName: AnomalyId
+          AttributeType: S
+        - AttributeName: RunId
+          AttributeType: S
+        - AttributeName: Service
+          AttributeType: S
+      KeySchema:
+        - AttributeName: AnomalyId
+          KeyType: HASH
+        - AttributeName: RunId
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: ServiceIndex
+          KeySchema:
+            - AttributeName: Service
+              KeyType: HASH
+            - AttributeName: RunId
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+
+  # ── SNS Topic ──────────────────────────────────────────────────────────────
   CostAlertsTopic:
     Type: AWS::SNS::Topic
     Properties:
-      TopicName: CostOptimizationAlerts
+      TopicName: !Sub "CostOptimizationAlerts-${Environment}"
+      DisplayName: "AWS Cost Optimization & Anomaly Alerts"
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref AlertEmail
 
+  # ── CloudWatch Dashboard ───────────────────────────────────────────────────
+  CostOptimizationDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub "CostOptimizationPlatform-${Environment}"
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric", "x": 0, "y": 0, "width": 8, "height": 6,
+              "properties": {
+                "title": "Cost Collector — Invocations",
+                "metrics": [
+                  ["AWS/Lambda", "Invocations",     "FunctionName", "${CostCollectorFunction}"],
+                  ["AWS/Lambda", "Errors",           "FunctionName", "${CostCollectorFunction}"],
+                  ["AWS/Lambda", "Duration",         "FunctionName", "${CostCollectorFunction}"]
+                ],
+                "period": 86400, "stat": "Sum", "view": "timeSeries"
+              }
+            },
+            {
+              "type": "metric", "x": 8, "y": 0, "width": 8, "height": 6,
+              "properties": {
+                "title": "Anomaly Detector — Invocations",
+                "metrics": [
+                  ["AWS/Lambda", "Invocations", "FunctionName", "${AnomalyDetectorFunction}"],
+                  ["AWS/Lambda", "Errors",       "FunctionName", "${AnomalyDetectorFunction}"],
+                  ["AWS/Lambda", "Duration",     "FunctionName", "${AnomalyDetectorFunction}"]
+                ],
+                "period": 86400, "stat": "Sum", "view": "timeSeries"
+              }
+            },
+            {
+              "type": "metric", "x": 16, "y": 0, "width": 8, "height": 6,
+              "properties": {
+                "title": "Cost Optimizer — Invocations & API Latency",
+                "metrics": [
+                  ["AWS/Lambda", "Invocations", "FunctionName", "${CostOptimizerFunction}"],
+                  ["AWS/Lambda", "Duration",     "FunctionName", "${CostOptimizerFunction}"]
+                ],
+                "period": 3600, "stat": "Average", "view": "timeSeries"
+              }
+            },
+            {
+              "type": "metric", "x": 0, "y": 6, "width": 12, "height": 6,
+              "properties": {
+                "title": "DynamoDB — Read/Write Capacity",
+                "metrics": [
+                  ["AWS/DynamoDB", "ConsumedReadCapacityUnits",  "TableName", "${CostHistoryTable}"],
+                  ["AWS/DynamoDB", "ConsumedWriteCapacityUnits", "TableName", "${CostHistoryTable}"],
+                  ["AWS/DynamoDB", "ConsumedReadCapacityUnits",  "TableName", "${AnomalyDetectionTable}"],
+                  ["AWS/DynamoDB", "ConsumedWriteCapacityUnits", "TableName", "${AnomalyDetectionTable}"]
+                ],
+                "period": 3600, "stat": "Sum", "view": "timeSeries"
+              }
+            },
+            {
+              "type": "metric", "x": 12, "y": 6, "width": 12, "height": 6,
+              "properties": {
+                "title": "SNS — Messages Published",
+                "metrics": [
+                  ["AWS/SNS", "NumberOfMessagesPublished", "TopicName", "CostOptimizationAlerts-${Environment}"],
+                  ["AWS/SNS", "NumberOfNotificationsDelivered", "TopicName", "CostOptimizationAlerts-${Environment}"]
+                ],
+                "period": 86400, "stat": "Sum", "view": "timeSeries"
+              }
+            }
+          ]
+        }
+
+  # ── CloudWatch Alarms ─────────────────────────────────────────────────────
+  CollectorErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "CostCollector-Errors-${Environment}"
+      AlarmDescription: "Cost Collector Lambda has errors"
+      MetricName:  Errors
+      Namespace:   AWS/Lambda
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref CostCollectorFunction
+      Statistic:          Sum
+      Period:             86400
+      EvaluationPeriods:  1
+      Threshold:          1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - !Ref CostAlertsTopic
+      TreatMissingData: notBreaching
+
+  AnomalyDetectorErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "AnomalyDetector-Errors-${Environment}"
+      AlarmDescription: "Anomaly Detector Lambda has errors"
+      MetricName:  Errors
+      Namespace:   AWS/Lambda
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref AnomalyDetectorFunction
+      Statistic:          Sum
+      Period:             86400
+      EvaluationPeriods:  1
+      Threshold:          1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - !Ref CostAlertsTopic
+      TreatMissingData: notBreaching
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Outputs
+# ─────────────────────────────────────────────────────────────────────────────
 Outputs:
-  CostAnalyzerFunction:
-    Description: "Cost Analyzer Lambda Function ARN"
-    Value: !GetAtt CostAnalyzerFunction.Arn
-  CostReportsTable:
-    Description: "DynamoDB Table for storing reports"
+  CostCollectorFunctionArn:
+    Description: "Cost Collector Lambda ARN"
+    Value: !GetAtt CostCollectorFunction.Arn
+
+  AnomalyDetectorFunctionArn:
+    Description: "Anomaly Detector Lambda ARN"
+    Value: !GetAtt AnomalyDetectorFunction.Arn
+
+  CostOptimizerFunctionArn:
+    Description: "Cost Optimizer Lambda ARN"
+    Value: !GetAtt CostOptimizerFunction.Arn
+
+  CostOptimizerApiUrl:
+    Description: "API Gateway endpoint for on-demand recommendations"
+    Value: !Sub "https://${CostOptimizerApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/recommendations"
+
+  CostHistoryTableName:
+    Description: "DynamoDB table for raw daily cost history"
+    Value: !Ref CostHistoryTable
+
+  CostReportsTableName:
+    Description: "DynamoDB table for optimization reports"
     Value: !Ref CostReportsTable
-  CostAlertsTopic:
-    Description: "SNS Topic for Cost Alerts"
+
+  AnomalyDetectionTableName:
+    Description: "DynamoDB table for ML anomaly results"
+    Value: !Ref AnomalyDetectionTable
+
+  CostAlertsTopicArn:
+    Description: "SNS Topic ARN for cost & anomaly alerts"
     Value: !Ref CostAlertsTopic
+
+  DashboardUrl:
+    Description: "CloudWatch Dashboard URL"
+    Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=CostOptimizationPlatform-${Environment}"

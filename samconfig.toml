@@ -1,0 +1,24 @@
+version = 0.1
+
+[default]
+[default.global.parameters]
+stack_name = "cloud-cost-platform"
+
+[default.build.parameters]
+cached = true
+parallel = true
+
+[default.deploy.parameters]
+capabilities = "CAPABILITY_IAM"
+confirm_changeset = true
+resolve_s3 = true
+s3_prefix = "cloud-cost-optimization-platform"
+region = "us-east-1"
+parameter_overrides = [
+  "AlertEmail=vaibhavsudrik2005@gmail.com",
+  "Environment=production",
+  "CollectionSchedule=rate(1 day)",
+  "AnomalyDetectionSchedule=cron(0 2 * * ? *)",
+  "IFContamination=0.05",
+  "IFNEstimators=200"
+]
