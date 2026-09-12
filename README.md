@@ -299,6 +299,4 @@ sam delete --stack-name cloud-cost-platform
 - 📧 [vaibhavsudrik2005@gmail.com](mailto:vaibhavsudrik2005@gmail.com)
 - 🎓 BSc Cloud Computing
 
-## 📄 License
 
-MIT License — see [LICENSE](LICENSE) for details.
